@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import time
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -12,6 +14,8 @@ from vllm.distributed.kv_events import (
 )
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.prefix_cache_policy import ARCPolicy, PolicyStats
+from vllm.v1.core.policy_stack import MODES, build_policy_stack
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
@@ -166,11 +170,38 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        eviction_policy: str = "lru",
+        eviction_policy_extra: str | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        # Prefix-cache replacement policy stack: "lru" keeps the native
+        # vLLM structural LRU (free-queue order) untouched; the other
+        # modes compose GPU policy / admission / hotness tracking (see
+        # policy_stack.py).
+        if eviction_policy not in MODES:
+            raise ValueError(
+                f"Unknown prefix cache eviction policy: {eviction_policy}; "
+                f"expected one of {MODES}")
+        self.eviction_policy = eviction_policy
+        self.eviction_policy_extra = eviction_policy_extra
+        profile = os.environ.get("VLLM_POLICY_PROFILING", "1") != "0"
+        self.policy_stats = PolicyStats(eviction_policy, profile=profile)
+        self.policy = None
+        self.admission = None
+        self.stack = None
+        self.stack_configured = False
+        if enable_caching:
+            self.stack = build_policy_stack(
+                eviction_policy, eviction_policy_extra, num_gpu_blocks,
+                self.policy_stats)
+            self.policy = self.stack.gpu_policy
+            self.admission = self.stack.admission
+            self.stack_configured = True
+            from vllm.v1.core.policy_stack import register_stack
+            register_stack(self.stack)
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -196,7 +227,8 @@ class BlockPool:
         self.metrics_collector = metrics_collector
 
     def get_cached_block(
-        self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+        self, block_hash: BlockHash, kv_cache_group_ids: list[int],
+        depth: int | None = None,
     ) -> list[KVCacheBlock] | None:
         """Get the cached block by the block hash for each group in
         `kv_cache_group_ids`, or None if cache miss for any group.
@@ -205,6 +237,8 @@ class BlockPool:
         Args:
             block_hash: The hash value of the block.
             kv_cache_group_ids: The ids of the KV cache groups.
+            depth: Optional block index within the request (prefix depth);
+                recorded as a reuse event for the depth-aware admission.
 
         Returns:
             The cached blocks if exists, or None.
@@ -220,6 +254,8 @@ class BlockPool:
             if not block:
                 return None
             cached_blocks.append(block)
+        if cached_blocks and self.admission is not None and depth is not None:
+            self.admission.on_reuse(depth)
         return cached_blocks
 
     def cache_full_blocks(
@@ -290,11 +326,55 @@ class BlockPool:
                 )
                 removed_hashes = self._remove_cached_block_hashes(blk)
                 self._emit_block_removed_events(removed_hashes)
-            self._insert_block_hash(
-                block_hash_with_group_id,
-                blk,
-                num_tokens=num_hash_tokens,
+            already_cached = (
+                blk.block_hash == block_hash_with_group_id
+                or self.cached_block_hash_to_block.contain(
+                    block_hash_with_group_id, blk.block_id
+                )
             )
+            depth = num_cached_blocks + i  # block index within the request
+            parent_hash = (
+                new_block_hashes[i - 1] if i > 0 else None
+            )
+            parent_hash_g = (
+                make_block_hash_with_group_id(parent_hash, kv_cache_group_id)
+                if parent_hash is not None else None
+            )
+            admitted = True
+            if (
+                self.admission is not None
+                and not already_cached
+                and not blk.is_null
+            ):
+                # Buoy depth-aware admission: rejected blocks are not
+                # registered in the prefix cache (equivalent to hashless
+                # blocks -> earliest reuse/eviction, i.e. quick demotion).
+                t0 = time.perf_counter_ns() if self.policy_stats.profile else 0
+                admitted = self.admission.admit(
+                    block_hash_with_group_id, depth)
+                self.policy_stats.insert_ops += 1
+                if self.policy_stats.profile:
+                    self.policy_stats.insert_ns += time.perf_counter_ns() - t0
+            if admitted:
+                self._insert_block_hash(
+                    block_hash_with_group_id,
+                    blk,
+                    num_tokens=num_hash_tokens,
+                )
+                if (
+                    self.policy is not None
+                    and not already_cached
+                    and not blk.is_null
+                ):
+                    # Fresh (hash -> block) mapping: notify the GPU policy
+                    # (ARC ghost adaptation / HotPrefix tracker + tree).
+                    t0 = time.perf_counter_ns() if self.policy_stats.profile else 0
+                    self.policy.on_block_cached(
+                        blk.block_id, block_hash_with_group_id,
+                        depth=depth, parent_hash=parent_hash_g)
+                    self.policy_stats.insert_ops += 1
+                    if self.policy_stats.profile:
+                        self.policy_stats.insert_ns += time.perf_counter_ns() - t0
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -658,6 +738,11 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
+        if self.policy is not None:
+            return self._get_new_blocks_policy(num_blocks)
+
+        stats = self.policy_stats
+        t0 = time.perf_counter_ns() if stats.profile else 0
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
@@ -668,12 +753,63 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+                stats.evict_ops += 1
         else:
             for block in ret:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        if stats.profile:
+            stats.evict_ns += time.perf_counter_ns() - t0
+        return ret
+
+    def _get_new_blocks_policy(self, num_blocks: int) -> list[KVCacheBlock]:
+        """Allocation under the ARC policy.
+
+        Victim selection: hashless (uncached) free blocks are reused first
+        from the queue head (preserving vLLM's LIFO locality for hashless
+        blocks and keeping them outside ARC's key space); cached free blocks
+        are selected by ARC REPLACE via ``policy.select_victim()``. Blocks
+        referenced by any request never appear in T1/T2 and thus can never
+        be evicted.
+        """
+        stats = self.policy_stats
+        t0 = time.perf_counter_ns() if stats.profile else 0
+        queue = self.free_block_queue
+        ret: list[KVCacheBlock] = []
+        while len(ret) < num_blocks:
+            head = queue.fake_free_list_head.next_free_block
+            if head is queue.fake_free_list_tail or head is None:
+                raise ValueError("No free blocks available in the pool")
+            if head.block_hash is None:
+                # Uncached block: reuse from the head as native vLLM does.
+                block = queue.popleft()
+                stats.uncached_pops += 1
+            else:
+                victim = self.policy.select_victim()
+                if victim is None:
+                    # Safety valve: a cached free block that the policy does
+                    # not track (should not happen). Fall back to queue order.
+                    logger.warning(
+                        "ARC policy found no victim; falling back to queue head"
+                    )
+                    block = queue.popleft()
+                    self.policy.forget_block(block.block_id)
+                    stats.evict_ops += 1
+                else:
+                    block_id, _ = victim
+                    block = self.blocks[block_id]
+                    queue.remove(block)
+                    stats.evict_ops += 1
+            self._maybe_evict_cached_block(block)
+            assert block.ref_cnt == 0
+            block.ref_cnt += 1
+            ret.append(block)
+            if self.metrics_collector:
+                self.metrics_collector.on_block_allocated(block)
+        if stats.profile:
+            stats.evict_ns += time.perf_counter_ns() - t0
         return ret
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
@@ -707,23 +843,34 @@ class BlockPool:
         Args:
             blocks: A list of blocks to touch.
         """
+        stats = self.policy_stats
+        t0 = time.perf_counter_ns() if stats.profile else 0
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
+                if self.policy is not None and block.block_hash is not None:
+                    # Prefix-cache hit on a free cached block: notify the
+                    # policy exactly once per free->referenced transition.
+                    self.policy.on_touch(block.block_id, block.block_hash)
+                stats.touch_ops += 1
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
+        if stats.profile:
+            stats.touch_ns += time.perf_counter_ns() - t0
 
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
         Args:
-            ordered_blocks: A list of blocks to free ordered by their eviction
-                priority.
+            ordered_blocks: A list of blocks to free ordered by their
+            eviction priority.
         """
+        stats = self.policy_stats
+        t0 = time.perf_counter_ns() if stats.profile else 0
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last = []
         blocks_to_evict_first = []
@@ -734,13 +881,32 @@ class BlockPool:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
                 else:
+                    drop = (
+                        self.policy is not None
+                        and getattr(self.policy, "drop_on_free", None) is not None
+                        and self.policy.drop_on_free(block.block_id)
+                    )
+                    if self.policy is not None:
+                        self.policy.on_free(block.block_id, block.block_hash)
+                    if drop:
+                        # Buoy H-queue semantics: chunks that were never hit
+                        # are not retained in the GPU cache — unregister the
+                        # hash so the block follows the native hashless
+                        # reuse order (quick demotion).
+                        removed = self._remove_cached_block_hashes(block)
+                        self._emit_block_removed_events(removed)
+                        blocks_to_evict_first.append(block)
+                        continue
                     # FIFO reuse of cached blocks for LRU eviction behavior.
+                    stats.free_ops += 1
                     blocks_to_evict_last.append(block)
 
         # Blocks to reuse first are prepended to the front of the free queue.
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
+        if stats.profile:
+            stats.free_ns += time.perf_counter_ns() - t0
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -759,6 +925,10 @@ class BlockPool:
                 f"only report block IDs that were allocated by the scheduler."
             )
             block = self.blocks[block_id]
+            if self.policy is not None and block.ref_cnt == 0:
+                # External eviction: drop from policy structures without
+                # creating a ghost entry (not an ARC replacement decision).
+                self.policy.forget_block(block_id)
             self._maybe_evict_cached_block(block)
 
     def reset_prefix_cache(self) -> bool:
@@ -786,6 +956,23 @@ class BlockPool:
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+
+        # Reset the replacement policy state and its control-plane stats so
+        # that accounting restarts from a clean cache.
+        if self.policy is not None:
+            self.policy.reset()
+        if self.admission is not None:
+            self.admission.reset()
+        self.policy_stats = PolicyStats(
+            self.eviction_policy,
+            profile=os.environ.get("VLLM_POLICY_PROFILING", "1") != "0",
+        )
+        if self.stack is not None:
+            self.stack = build_policy_stack(
+                self.eviction_policy, None, self.num_gpu_blocks,
+                self.policy_stats)
+            self.policy = self.stack.gpu_policy
+            self.admission = self.stack.admission
 
         if self.metrics_collector:
             self.metrics_collector.reset()
@@ -817,6 +1004,54 @@ class BlockPool:
         if not total_gpu_blocks:
             return 0
         return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)
+
+    def configure_eviction_policy(self, eviction_policy: str) -> None:
+        """Install (or confirm) the prefix-cache replacement policy stack.
+
+        Must be called before any block allocation. "lru" keeps the native
+        structural-LRU behavior; other modes build their component stack
+        (see policy_stack.py).
+        """
+        if eviction_policy not in MODES:
+            raise ValueError(
+                f"Unknown prefix cache eviction policy: {eviction_policy}; "
+                f"expected one of {MODES}")
+        if eviction_policy == self.eviction_policy and self.stack_configured:
+            return
+        if self.get_num_free_blocks() != self.num_gpu_blocks - 1:
+            raise RuntimeError(
+                "configure_eviction_policy must be called before any block "
+                "allocation"
+            )
+        if not self.enable_caching and eviction_policy != "lru":
+            raise ValueError(
+                f"{eviction_policy} requires prefix caching")
+        self.eviction_policy = eviction_policy
+        self.policy_stats = PolicyStats(
+            eviction_policy,
+            profile=os.environ.get("VLLM_POLICY_PROFILING", "1") != "0",
+        )
+        self.stack = build_policy_stack(
+            eviction_policy, self.eviction_policy_extra, self.num_gpu_blocks,
+            self.policy_stats)
+        self.policy = self.stack.gpu_policy
+        self.admission = self.stack.admission
+        self.stack_configured = True
+        from vllm.v1.core.policy_stack import register_stack
+        register_stack(self.stack)
+
+    def policy_stats_snapshot(self) -> dict:
+        """Snapshot of the replacement-policy control-plane stats, including
+        the current queue lengths (zeros for LRU) and stack diagnostics.
+        """
+        snap = self.policy_stats.snapshot()
+        if self.policy is not None and hasattr(self.policy, "lengths"):
+            snap.update(self.policy.lengths())
+        else:
+            snap.update({"t1": 0, "t2": 0, "b1": 0, "b2": 0, "p": 0})
+        if self.stack is not None:
+            snap["policy_stack"] = self.stack.snapshot()
+        return snap
 
     def take_events(self) -> list[KVCacheEvent]:
         """Atomically takes all events and clears the queue.

@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import heapq
+import logging
+import os
+import threading
+import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
@@ -9,12 +13,15 @@ from enum import Enum
 
 from vllm.v1.request import Request
 
+logger = logging.getLogger(__name__)
+
 
 class SchedulingPolicy(Enum):
     """Enum for scheduling policies."""
 
     FCFS = "fcfs"
     PRIORITY = "priority"
+    EWSJF = "ewsjf"
 
 
 class RequestQueue(ABC):
@@ -198,11 +205,17 @@ class PriorityRequestQueue(RequestQueue):
             yield heapq.heappop(heap_copy)
 
 
-def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
+def create_request_queue(
+    policy: SchedulingPolicy, scheduler_config: object | None = None
+) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
+    elif policy == SchedulingPolicy.EWSJF:
+        from vllm.v1.core.sched.ewsjf_queue import EWSJFRequestQueue
+
+        return EWSJFRequestQueue(scheduler_config)
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")

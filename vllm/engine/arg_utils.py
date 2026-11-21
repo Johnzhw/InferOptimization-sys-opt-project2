@@ -519,6 +519,8 @@ class EngineArgs:
     )
     block_size: int | None = None
     enable_prefix_caching: bool | None = None
+    eviction_policy: str = CacheConfig.eviction_policy
+    eviction_policy_extra: str | None = CacheConfig.eviction_policy_extra
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -668,6 +670,12 @@ class EngineArgs:
     jit_monitor_verbose: bool = ObservabilityConfig.jit_monitor_verbose
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
+    ewsjf_max_queues: int = SchedulerConfig.ewsjf_max_queues
+    ewsjf_alpha: float = SchedulerConfig.ewsjf_alpha
+    ewsjf_window: int = SchedulerConfig.ewsjf_window
+    ewsjf_strategic_interval: float = SchedulerConfig.ewsjf_strategic_interval
+    ewsjf_bubble_width: int = SchedulerConfig.ewsjf_bubble_width
+    ewsjf_meta_trials: int = SchedulerConfig.ewsjf_meta_trials
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
@@ -1225,6 +1233,12 @@ class EngineArgs:
             "--prefix-caching-hash-algo", **cache_kwargs["prefix_caching_hash_algo"]
         )
         cache_group.add_argument(
+            "--eviction-policy", **cache_kwargs["eviction_policy"]
+        )
+        cache_group.add_argument(
+            "--eviction-policy-extra", **cache_kwargs["eviction_policy_extra"]
+        )
+        cache_group.add_argument(
             "--kv-cache-dtype-skip-layers", **cache_kwargs["kv_cache_dtype_skip_layers"]
         )
         cache_group.add_argument(
@@ -1532,6 +1546,25 @@ class EngineArgs:
         # are no longer supported.
         scheduler_group.add_argument(
             "--scheduling-policy", **scheduler_kwargs["policy"]
+        )
+        scheduler_group.add_argument(
+            "--ewsjf-max-queues", **scheduler_kwargs["ewsjf_max_queues"]
+        )
+        scheduler_group.add_argument(
+            "--ewsjf-alpha", **scheduler_kwargs["ewsjf_alpha"]
+        )
+        scheduler_group.add_argument(
+            "--ewsjf-window", **scheduler_kwargs["ewsjf_window"]
+        )
+        scheduler_group.add_argument(
+            "--ewsjf-strategic-interval",
+            **scheduler_kwargs["ewsjf_strategic_interval"],
+        )
+        scheduler_group.add_argument(
+            "--ewsjf-bubble-width", **scheduler_kwargs["ewsjf_bubble_width"]
+        )
+        scheduler_group.add_argument(
+            "--ewsjf-meta-trials", **scheduler_kwargs["ewsjf_meta_trials"]
         )
         scheduler_group.add_argument(
             "--enable-chunked-prefill",
@@ -2000,6 +2033,8 @@ class EngineArgs:
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
+            eviction_policy=self.eviction_policy,
+            eviction_policy_extra=self.eviction_policy_extra,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
@@ -2319,6 +2354,12 @@ class EngineArgs:
             is_multimodal_model=model_config.is_multimodal_model,
             is_encoder_decoder=model_config.is_encoder_decoder,
             policy=self.scheduling_policy,
+            ewsjf_max_queues=self.ewsjf_max_queues,
+            ewsjf_alpha=self.ewsjf_alpha,
+            ewsjf_window=self.ewsjf_window,
+            ewsjf_strategic_interval=self.ewsjf_strategic_interval,
+            ewsjf_bubble_width=self.ewsjf_bubble_width,
+            ewsjf_meta_trials=self.ewsjf_meta_trials,
             scheduler_cls=self.scheduler_cls,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,

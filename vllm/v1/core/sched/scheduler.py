@@ -185,9 +185,11 @@ class Scheduler(SchedulerInterface):
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
         # Priority queues for requests.
-        self.waiting = create_request_queue(self.policy)
+        self.waiting = create_request_queue(self.policy, self.scheduler_config)
         # requests skipped in waiting flow due async deps or constraints.
-        self.skipped_waiting = create_request_queue(self.policy)
+        self.skipped_waiting = create_request_queue(
+            self.policy, self.scheduler_config
+        )
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -290,6 +292,14 @@ class Scheduler(SchedulerInterface):
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
         )
+        # Install the prefix-cache replacement policy stack ("lru" native
+        # default, or one of the experiment modes). Must happen before any
+        # block allocation.
+        self.kv_cache_manager.block_pool.configure_eviction_policy(
+            self.cache_config.eviction_policy
+        )
+        # HotPrefix aging bookkeeping (§3.2.2): counters on the stack.
+        self._policy_reqs_since_age = 0
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
@@ -746,7 +756,9 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            step_skipped_waiting = create_request_queue(self.policy)
+            step_skipped_waiting = create_request_queue(
+                self.policy, self.scheduler_config
+            )
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if input_budget <= draft_slots:
@@ -2035,6 +2047,19 @@ class Scheduler(SchedulerInterface):
             self.waiting.remove_requests(stopped_preempted_reqs)
             self.skipped_waiting.remove_requests(stopped_preempted_reqs)
 
+        # HotPrefix §3.2.2 aging: after a fixed number of processed user
+        # requests, decrement every tracked clock by one (floor 0).
+        pool = self.kv_cache_manager.block_pool
+        stack = getattr(pool, "stack", None)
+        if stack is not None and stack.tracker is not None:
+            self._policy_reqs_since_age += len(
+                stopped_running_reqs) + len(stopped_preempted_reqs)
+            if self._policy_reqs_since_age >= stack.age_interval:
+                self._policy_reqs_since_age = 0
+                stack.tracker.age()
+                if hasattr(pool.policy, "on_aged"):
+                    pool.policy.on_aged()
+
         error_req_ids = set(self.grammar_compile_error_reqs)
         self.grammar_compile_error_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
@@ -2616,6 +2641,7 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            policy_stats=self.kv_cache_manager.block_pool.policy_stats_snapshot(),
         )
 
     def make_spec_decoding_stats(

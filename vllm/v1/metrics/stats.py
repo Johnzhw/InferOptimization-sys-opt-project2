@@ -213,6 +213,12 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    # Cumulative snapshot of the prefix-cache replacement policy control
+    # plane (ops, wall time, ARC queue lengths). None when stats are not
+    # collected. Values are cumulative since startup or the last prefix
+    # cache reset, so consumers diff successive snapshots.
+    policy_stats: dict[str, Any] | None = None
+
 
 @dataclass
 class RequestStateStats:

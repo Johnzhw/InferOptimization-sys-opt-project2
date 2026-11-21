@@ -95,6 +95,21 @@ class CacheConfig:
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
+    eviction_policy: str = "lru"
+    """Replacement/scheduling policy stack for the GPU-resident prefix
+    cache. "lru" is the native vLLM structural LRU (free-queue order).
+    Other modes: "arc" (Adaptive Replacement Cache), "lru_buoy_admission"
+    / "arc_buoy_admission" (native or ARC GPU replacement plus Buoy
+    depth-aware admission), "lru_tiered" / "arc_tiered" (CPU KV offload
+    tier with CPU LRU), "hotprefix" (hotness-aware eviction + selective
+    CPU admission + hotness promotion), "buoy" (HBM/DRAM hierarchical
+    queues + depth-aware admission), "arc_hotprefix_admission" (ARC GPU
+    replacement + HotPrefix hotness tracking + selective CPU admission).
+    """
+    eviction_policy_extra: str | None = None
+    """JSON string with per-mode knobs and ablation switches (e.g.
+    {"max_age":255,"age_interval":256,"freq_threshold":10,
+    "promotion":true,"cpu_admission":true,"depth_admission":true})."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
 
@@ -217,6 +232,8 @@ class CacheConfig:
             "num_gpu_blocks_override",
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
+            "eviction_policy",
+            "eviction_policy_extra",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
             "mamba_page_size_padded",

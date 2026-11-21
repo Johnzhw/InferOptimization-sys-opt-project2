@@ -721,6 +721,22 @@ class GPUModelRunner(
             self.use_async_scheduling and self.num_spec_tokens > 0
         )
 
+        # Conjugate Compilation co-scheduling (draft prefill overlap on a
+        # secondary CUDA stream); active only when explicitly enabled.
+        self.conjugate_co = None
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.conjugate_coschedule
+            and self.drafter is not None
+        ):
+            from vllm.v1.spec_decode.conjugate_coscheduler import (
+                ConjugateCoScheduler,
+            )
+
+            self.conjugate_co = ConjugateCoScheduler(
+                self.drafter, self.max_num_tokens
+            )
+
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
         # NOTE(rob): num_prompt_logprobs only includes reqs
@@ -3954,6 +3970,209 @@ class GPUModelRunner(
         finally:
             self.prepare_inputs_event.record()
 
+    def _conjugate_reduce_first_pass(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        cad,
+    ):
+        """Reduce the drafter's first pass to rows not already warmed by the
+        side-stream draft prefill: warmed requests keep only their last
+        scheduled token as a query row (its KV recompute overwrites the same
+        slot), all other rows pass through unchanged."""
+        co = self.conjugate_co
+        qsl_cpu = cad.query_start_loc_cpu
+        if qsl_cpu is None:
+            qsl_cpu = cad.query_start_loc.detach().cpu()
+        import numpy as np
+
+        keep: list[int] = []
+        new_lens: list[int] = []
+        for i in range(cad.num_reqs):
+            s, e = int(qsl_cpu[i]), int(qsl_cpu[i + 1])
+            span = e - s
+            warmed = co.pending_warm.get(i, 0)
+            if warmed > 1 and span > 1:
+                keep.append(e - 1)
+                new_lens.append(1)
+                co._counters["propose_rows_saved"] += span - 1
+            else:
+                keep.extend(range(s, e))
+                new_lens.append(span)
+        keep_rows = torch.as_tensor(keep, dtype=torch.int64, device=self.device)
+        total = len(keep)
+        new_qsl_np = np.zeros(len(new_lens) + 1, dtype=np.int32)
+        np.cumsum(new_lens, out=new_qsl_np[1:])
+        new_qsl = torch.as_tensor(new_qsl_np, device=self.device)
+        new_qsl_cpu = torch.as_tensor(new_qsl_np)
+        slot = (
+            cad.slot_mapping[keep_rows]
+            if cad.slot_mapping is not None and cad.slot_mapping.numel() > 0
+            else None
+        )
+        reduced = CommonAttentionMetadata(
+            query_start_loc=new_qsl,
+            query_start_loc_cpu=new_qsl_cpu,
+            seq_lens=cad.seq_lens,
+            _seq_lens_cpu=cad._seq_lens_cpu,
+            _num_computed_tokens_cpu=cad._num_computed_tokens_cpu,
+            seq_lens_cpu_upper_bound=cad.seq_lens_cpu_upper_bound,
+            num_reqs=cad.num_reqs,
+            num_actual_tokens=total,
+            max_query_len=max(new_lens) if new_lens else 0,
+            max_seq_len=cad.max_seq_len,
+            block_table_tensor=cad.block_table_tensor,
+            slot_mapping=slot,
+            causal=True,
+        )
+        positions_all = target_positions
+        return (
+            target_token_ids[keep_rows],
+            positions_all[keep_rows],
+            target_hidden_states[keep_rows],
+            reduced,
+        )
+
+    def _conjugate_maybe_warmup(
+        self,
+        scheduler_output: "SchedulerOutput",
+        cad,
+        slot_mappings: dict,
+    ) -> None:
+        """Draft-prefill warmup on the secondary CUDA stream (Conjugate
+        Compilation co-scheduling). For every request whose scheduled span
+        contains real prompt tokens (span > 1 + spec tokens), run the draft
+        model over those tokens concurrently with the target forward.
+
+        The draft layers share the group-0 KV blocks with the target layers
+        (same slot indices, separate per-layer tensors), so the warmup writes
+        valid draft-KV slots at the prompt positions without any extra
+        allocation. Inputs are read-only here; the join happens before the
+        drafter proposal pass via ``conjugate_co.join_event``.
+        """
+        co = self.conjugate_co
+        co.step_reset()
+        if cad is None or cad.num_reqs == 0:
+            return
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens or {}
+        qsl_cpu = cad.query_start_loc_cpu
+        if qsl_cpu is None:
+            qsl_cpu = cad.query_start_loc.detach().cpu()
+        req_ids = self.input_batch.req_ids
+        prefill_rows: list[int] = []
+        for i in range(cad.num_reqs):
+            if i >= len(req_ids):
+                break
+            span = int(qsl_cpu[i + 1]) - int(qsl_cpu[i])
+            n_spec = len(spec_tokens.get(req_ids[i], []))
+            if span > 1 + n_spec:
+                prefill_rows.append(i)
+        if not prefill_rows:
+            return
+
+        import time as _time
+
+        t0 = _time.perf_counter()
+        import numpy as np
+
+        spans = np.array(
+            [int(qsl_cpu[i + 1]) - int(qsl_cpu[i]) for i in prefill_rows],
+            dtype=np.int64,
+        )
+        starts = np.array([int(qsl_cpu[i]) for i in prefill_rows], dtype=np.int64)
+        num_tokens = int(spans.sum())
+        seq_lens_cpu = (
+            cad._seq_lens_cpu if cad._seq_lens_cpu is not None
+            else cad.seq_lens.detach().cpu()
+        )
+        # flat rows of the step batch belonging to these spans
+        row_ranges = [
+            np.arange(int(s), int(s + n)) for s, n in zip(starts, spans)
+        ]
+        rows_np = np.concatenate(row_ranges)
+        rows = torch.as_tensor(rows_np, dtype=torch.int64, device=self.device)
+        row_idx = torch.as_tensor(prefill_rows, dtype=torch.int64,
+                                  device=self.device)
+        # absolute positions of those rows: [seq_lens - span, seq_lens)
+        pos_np = np.concatenate(
+            [
+                np.arange(int(seq_lens_cpu[i]) - n, int(seq_lens_cpu[i]))
+                for i, n in zip(prefill_rows, spans)
+            ]
+        )
+        input_ids = self.input_ids.gpu[rows]
+        slot_mapping = slot_mappings[0][rows]
+
+        co.warm_input_ids[:num_tokens] = input_ids.to(torch.int32)
+        co.warm_positions[:num_tokens] = torch.as_tensor(
+            pos_np, dtype=torch.int64, device=self.device
+        )
+
+        # subset CAD over just the prefilling requests
+        qsl_np = np.zeros(len(prefill_rows) + 1, dtype=np.int32)
+        np.cumsum(spans, out=qsl_np[1:])
+        sub_qsl = torch.as_tensor(qsl_np, device=self.device)
+        sub_seq_lens = cad.seq_lens[row_idx]
+        sub_cad = CommonAttentionMetadata(
+            query_start_loc=sub_qsl,
+            query_start_loc_cpu=torch.as_tensor(qsl_np),
+            seq_lens=sub_seq_lens,
+            num_reqs=len(prefill_rows),
+            num_actual_tokens=num_tokens,
+            max_query_len=int(spans.max()),
+            max_seq_len=int(sub_seq_lens.max().item()),
+            block_table_tensor=cad.block_table_tensor[row_idx]
+            if cad.block_table_tensor is not None else None,
+            slot_mapping=slot_mapping,
+            causal=True,
+        )
+        per_group_md, per_layer_md = (
+            self.drafter.build_per_group_and_layer_attn_metadata(sub_cad)
+        )
+        _, num_input_tokens, _ = (
+            self.drafter._determine_batch_execution_and_padding(
+                num_tokens, use_cudagraphs=False
+            )
+        )
+        main = torch.cuda.current_stream()
+        ready = torch.cuda.Event()
+        ready.record(main)
+        with torch.cuda.stream(co.stream):
+            co.stream.wait_event(ready)
+            with set_forward_context(
+                per_layer_md,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                slot_mapping={
+                    name: slot_mapping
+                    for name in self.drafter._draft_attn_layer_names
+                },
+            ):
+                self.drafter.model(
+                    input_ids=co.warm_input_ids[:num_input_tokens],
+                    positions=co.warm_positions[:num_input_tokens],
+                    inputs_embeds=None,
+                )
+            co.join_event.record(co.stream)
+        # bookkeeping for the reduced first pass
+        for j, i in enumerate(prefill_rows):
+            co.pending_warm[i] = int(spans[j])
+        co._counters["warmups_launched"] += 1
+        co._counters["warmup_tokens"] += num_tokens
+        co._counters["launch_cpu_us"] += (_time.perf_counter() - t0) * 1e6
+        if co._counters["warmups_launched"] % 256 == 1:
+            logger.info(
+                "Conjugate co-scheduling telemetry: warmups=%d tokens=%d "
+                "rows_saved=%d launch_cpu_us/op=%.1f",
+                co._counters["warmups_launched"],
+                co._counters["warmup_tokens"],
+                co._counters["propose_rows_saved"],
+                co._counters["launch_cpu_us"]
+                / max(co._counters["warmups_launched"], 1),
+            )
+
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -4513,6 +4732,16 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+
+            # Conjugate co-scheduling: launch the draft prefill for newly
+            # scheduled prompt tokens on the secondary stream, concurrent
+            # with the target forward enqueued below.
+            if self.conjugate_co is not None:
+                self._conjugate_maybe_warmup(
+                    scheduler_output,
+                    spec_decode_common_attn_metadata,
+                    slot_mappings_by_group,
+                )
 
             (
                 input_ids,
@@ -5329,6 +5558,31 @@ class GPUModelRunner(
                     )
                 else:
                     target_hidden_states = hidden_states[:num_scheduled_tokens]
+                # Conjugate co-scheduling: join the warmup stream, then
+                # reduce the drafter first pass to the non-warmed rows.
+                if (
+                    self.conjugate_co is not None
+                    and self.conjugate_co.pending_warm
+                ):
+                    logger.info_once(
+                        "Conjugate reduction branch entered "
+                        "(pending_warm rows=%d)",
+                        len(self.conjugate_co.pending_warm),
+                    )
+                    torch.cuda.current_stream().wait_event(
+                        self.conjugate_co.join_event
+                    )
+                    (
+                        target_token_ids,
+                        target_positions,
+                        target_hidden_states,
+                        common_attn_metadata,
+                    ) = self._conjugate_reduce_first_pass(
+                        target_token_ids,
+                        target_positions,
+                        target_hidden_states,
+                        common_attn_metadata,
+                    )
             else:
                 if spec_config.disable_padded_drafter_batch:
                     token_indices_to_sample = None

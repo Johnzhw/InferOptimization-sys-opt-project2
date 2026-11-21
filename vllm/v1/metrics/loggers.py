@@ -307,6 +307,36 @@ class LoggingStatLogger(StatLoggerBase):
             log_parts.append("MM cache hit rate: %.1f%%")
             log_args.append(self.mm_caching_metrics.hit_rate * 100)
 
+        policy = self.last_scheduler_stats.policy_stats
+        if policy is not None:
+            total_us = (
+                policy["touch_ns"] + policy["free_ns"] + policy["insert_ns"]
+                + policy["evict_ns"]) / 1e3
+            log_parts.append(
+                "Prefix cache policy: %s T1=%d T2=%d B1=%d B2=%d p=%d | "
+                "ghost_hits=%d promotions=%d evict_t1=%d evict_t2=%d | "
+                "policy_time_us=%.1f (touch=%.1f free=%.1f insert=%.1f evict=%.1f)"
+            )
+            log_args.extend(
+                [
+                    policy["policy"],
+                    policy["t1"],
+                    policy["t2"],
+                    policy["b1"],
+                    policy["b2"],
+                    policy["p"],
+                    policy["ghost_b1_hits"] + policy["ghost_b2_hits"],
+                    policy["promotions"],
+                    policy["evictions_t1"],
+                    policy["evictions_t2"],
+                    total_us,
+                    policy["touch_ns"] / 1e3,
+                    policy["free_ns"] / 1e3,
+                    policy["insert_ns"] / 1e3,
+                    policy["evict_ns"] / 1e3,
+                ]
+            )
+
         log_fn(
             self.log_prefix + ", ".join(log_parts),
             *log_args,
@@ -600,6 +630,87 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.counter_prefix_cache_hits = create_metric_per_engine(
             counter_prefix_cache_hits, per_engine_labelvalues
         )
+
+        #
+        # Prefix cache replacement policy control plane (LRU / ARC)
+        #
+        counter_prefix_policy_time_ns = self._counter_cls(
+            name="vllm:prefix_cache_policy_time_ns",
+            documentation=(
+                "Cumulative wall time (ns) in prefix-cache replacement policy "
+                "control plane (touch/free/insert/evict maintenance)."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_prefix_policy_time_ns = create_metric_per_engine(
+            counter_prefix_policy_time_ns, per_engine_labelvalues
+        )
+
+        counter_prefix_policy_ops = self._counter_cls(
+            name="vllm:prefix_cache_policy_ops",
+            documentation=(
+                "Cumulative number of managed block operations in the "
+                "prefix-cache replacement policy control plane."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_prefix_policy_ops = create_metric_per_engine(
+            counter_prefix_policy_ops, per_engine_labelvalues
+        )
+
+        counter_prefix_policy_ghost_hits = self._counter_cls(
+            name="vllm:prefix_cache_policy_ghost_hits",
+            documentation=(
+                "Cumulative ghost-list hits (B1+B2) of the ARC prefix-cache "
+                "replacement policy."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_prefix_policy_ghost_hits = create_metric_per_engine(
+            counter_prefix_policy_ghost_hits, per_engine_labelvalues
+        )
+
+        gauge_prefix_policy_t1 = self._gauge_cls(
+            name="vllm:prefix_cache_policy_t1_blocks",
+            documentation="ARC T1 (recency list) length in blocks.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_prefix_policy_t1 = create_metric_per_engine(
+            gauge_prefix_policy_t1, per_engine_labelvalues
+        )
+
+        gauge_prefix_policy_t2 = self._gauge_cls(
+            name="vllm:prefix_cache_policy_t2_blocks",
+            documentation="ARC T2 (frequency list) length in blocks.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_prefix_policy_t2 = create_metric_per_engine(
+            gauge_prefix_policy_t2, per_engine_labelvalues
+        )
+
+        gauge_prefix_policy_b1 = self._gauge_cls(
+            name="vllm:prefix_cache_policy_b1_blocks",
+            documentation="ARC B1 (recency ghost list) length in entries.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_prefix_policy_b1 = create_metric_per_engine(
+            gauge_prefix_policy_b1, per_engine_labelvalues
+        )
+
+        gauge_prefix_policy_b2 = self._gauge_cls(
+            name="vllm:prefix_cache_policy_b2_blocks",
+            documentation="ARC B2 (frequency ghost list) length in entries.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_prefix_policy_b2 = create_metric_per_engine(
+            gauge_prefix_policy_b2, per_engine_labelvalues
+        )
+
+        self._last_policy_stats: dict[int, dict] = {idx: {} for idx in engine_indexes}
 
         #
         # External - KV connector prefix cache
@@ -1128,6 +1239,36 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.counter_prefix_cache_hits[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.hits
             )
+
+            if scheduler_stats.policy_stats is not None:
+                ps = scheduler_stats.policy_stats
+                last = self._last_policy_stats.get(engine_idx, {})
+
+                def _pdiff(key: str) -> int:
+                    # Cumulative snapshots: diff successive values, clamped
+                    # at 0 to survive prefix-cache resets.
+                    return max(0, int(ps.get(key, 0)) - int(last.get(key, 0)))
+
+                self.counter_prefix_policy_time_ns[engine_idx].inc(
+                    _pdiff("touch_ns")
+                    + _pdiff("free_ns")
+                    + _pdiff("insert_ns")
+                    + _pdiff("evict_ns")
+                )
+                self.counter_prefix_policy_ops[engine_idx].inc(
+                    _pdiff("touch_ops")
+                    + _pdiff("free_ops")
+                    + _pdiff("insert_ops")
+                    + _pdiff("evict_ops")
+                )
+                self.counter_prefix_policy_ghost_hits[engine_idx].inc(
+                    _pdiff("ghost_b1_hits") + _pdiff("ghost_b2_hits")
+                )
+                self.gauge_prefix_policy_t1[engine_idx].set(ps.get("t1", 0))
+                self.gauge_prefix_policy_t2[engine_idx].set(ps.get("t2", 0))
+                self.gauge_prefix_policy_b1[engine_idx].set(ps.get("b1", 0))
+                self.gauge_prefix_policy_b2[engine_idx].set(ps.get("b2", 0))
+                self._last_policy_stats[engine_idx] = ps
 
             if scheduler_stats.connector_prefix_cache_stats is not None:
                 self.counter_connector_prefix_cache_queries[engine_idx].inc(

@@ -156,6 +156,15 @@ class SpeculativeConfig:
     draft logits to shared tokens only (TLI algorithm). Requires
     method='draft_model'."""
 
+    conjugate_coschedule: bool = False
+    """Enable the Conjugate Compilation co-scheduling execution scheme:
+    the draft model's prompt prefill for newly scheduled requests runs on
+    a secondary CUDA stream concurrently with the target model forward of
+    the same step (their inputs are data-independent), with a CUDA event
+    joining the streams before the drafter's proposal pass. Only applies
+    to method='draft_model'. The speculative round itself keeps the
+    sequential draft -> verify order (true dependency)."""
+
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
     """Maximum size of ngram token window when using Ngram proposer, required

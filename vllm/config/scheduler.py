@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
+SchedulerPolicy = Literal["fcfs", "priority", "ewsjf"]
 
 
 @config
@@ -99,10 +99,34 @@ class SchedulerConfig:
     policy: SchedulerPolicy = "fcfs"
     """The scheduling policy to use:
 
-    - "fcfs" means first come first served, i.e. requests are handled in order 
+    - "fcfs" means first come first served, i.e. requests are handled in order
       of arrival.
     - "priority" means requests are handled based on given priority (lower
-      value means earlier handling) and time of arrival deciding any ties)."""
+      value means earlier handling) and time of arrival deciding any ties).
+    - "ewsjf" enables the EWSJF adaptive scheduler: unsupervised
+      prompt-length partitioning (Refine-and-Prune) plus Density-Weighted
+      Scoring admission ordering for mixed short/long workloads."""
+
+    # -- EWSJF adaptive scheduler parameters (active only with policy=ewsjf)
+    ewsjf_max_queues: int = 32
+    """Maximum number of prompt-length queues kept by Refine-and-Prune."""
+
+    ewsjf_alpha: float = 2.0
+    """Gap significance ratio of the recursive refinement split rule."""
+
+    ewsjf_window: int = 4096
+    """Monitor ring-buffer capacity (observed scheduled requests)."""
+
+    ewsjf_strategic_interval: float = 30.0
+    """Seconds between strategic-loop (Refine-and-Prune) runs. <=0 disables
+    the background thread (policy stays at the initial three-queue split)."""
+
+    ewsjf_bubble_width: int = 256
+    """Default width (tokens) of an On-Demand Bubble Queue."""
+
+    ewsjf_meta_trials: int = 0
+    """Budget of Bayesian meta-optimization trials for the scoring weights.
+    0 disables the meta-optimizer (weights stay at defaults)."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to
