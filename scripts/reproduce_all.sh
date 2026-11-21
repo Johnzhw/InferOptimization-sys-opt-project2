@@ -36,7 +36,12 @@ echo "草稿模型: $DRAFT_MODEL"
 
 # 负载目录：优先用仓库自带的，缺失的从网上补
 WL_DIR="$REPO_DIR/workloads"
-RES_DIR="$REPRO_ROOT/results"
+# 结果目录：SMOKE 和全量分开存放，避免冒烟结果挡住正式实验
+if [ "$SMOKE" = "1" ]; then
+  RES_DIR="$REPRO_ROOT/results_smoke"
+else
+  RES_DIR="$REPRO_ROOT/results"
+fi
 mkdir -p "$RES_DIR"
 REG="$REPRO_ROOT/process_registry.jsonl"; touch "$REG"
 
