@@ -26,7 +26,7 @@ PORT="${PORT:-8891}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 SMOKE="${SMOKE:-0}"
 CONFIGS="${CONFIGS:-fcfs ewsjf spec ewsjf_spec}"
-WORKLOADS="${WORKLOADS:-W1 W2 W3 W4}"
+WORKLOADS="${WORKLOADS:-W1 W1_3p0 W2 W3 W3_1p6 W4}"
 
 # 校验模型路径
 [ -f "$TARGET_MODEL/config.json" ] || { echo "错误：TARGET_MODEL 无 config.json：$TARGET_MODEL"; exit 1; }
@@ -109,15 +109,19 @@ if [ ! -f "$WL_DIR/W3_synthetic_bimodal.jsonl" ] || [ ! -f "$WL_DIR/W4_synthetic
     "$PYOK" "$SCRIPT_DIR/gen_workloads.py"
 fi
 
-# 负载参数
+# 负载参数（含补充运行点）
 wl_args() {
   case "$1" in
     W1) if [ "$SMOKE" = 1 ]; then echo "sharegpt|$SHAREGPT|--num-prompts 12 --request-rate 1.0";
         else echo "sharegpt|$SHAREGPT|--num-prompts 300 --request-rate 2.0"; fi ;;
+    W1_3p0) if [ "$SMOKE" = 1 ]; then echo "sharegpt|$SHAREGPT|--num-prompts 12 --request-rate 2.0";
+        else echo "sharegpt|$SHAREGPT|--num-prompts 300 --request-rate 3.0"; fi ;;
     W2) if [ "$SMOKE" = 1 ]; then echo "custom|$WL_DIR/W2_sharegpt_long_output.jsonl|--custom-output-len -1 --num-prompts 8 --request-rate 0.5";
         else echo "custom|$WL_DIR/W2_sharegpt_long_output.jsonl|--custom-output-len -1 --num-prompts 400 --request-rate 0.5"; fi ;;
     W3) if [ "$SMOKE" = 1 ]; then echo "custom|$WL_DIR/W3_synthetic_bimodal.jsonl|--custom-output-len -1 --num-prompts 24 --request-rate 1.0";
         else echo "custom|$WL_DIR/W3_synthetic_bimodal.jsonl|--custom-output-len -1 --num-prompts 600 --request-rate 2.0"; fi ;;
+    W3_1p6) if [ "$SMOKE" = 1 ]; then echo "custom|$WL_DIR/W3_synthetic_bimodal.jsonl|--custom-output-len -1 --num-prompts 24 --request-rate 1.0";
+        else echo "custom|$WL_DIR/W3_synthetic_bimodal.jsonl|--custom-output-len -1 --num-prompts 600 --request-rate 1.6"; fi ;;
     W4) if [ "$SMOKE" = 1 ]; then echo "custom|$WL_DIR/W4_synthetic_decode_heavy.jsonl|--custom-output-len -1 --num-prompts 12 --request-rate 0.5";
         else echo "custom|$WL_DIR/W4_synthetic_decode_heavy.jsonl|--custom-output-len -1 --num-prompts 400 --request-rate 0.8"; fi ;;
   esac
@@ -206,7 +210,9 @@ done
 
 echo "== [3/5] 汇总 =="
 "$PYOK" "$SCRIPT_DIR/summarize_results.py" --results "$RES_DIR" \
-  --out "$RES_DIR" || echo "（汇总脚本执行失败，原始 result.json 不受影响）"
+  --out "$RES_DIR" || echo "（汇总脚本执行失败）"
+echo ""
+"$PYOK" "$SCRIPT_DIR/print_tables.py" "$RES_DIR" || true
 
 echo "== [4/5] 完成 =="
 echo "结果目录：$RES_DIR"
