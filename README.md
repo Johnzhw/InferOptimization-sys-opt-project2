@@ -1,110 +1,51 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+## 关于本仓库
+本仓库是一个基于 https://github.com/vllm-project/vllm 仓库的一个fork，用于完成系统优化课程的project2
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+本仓库实现的优化基于以下测量与观察：
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+vLLM通过页式注意力与连续批处理显著提升了吞吐，但其请求准入默认采用先来先服务策略，执行层默认将每个解码步组织为单次前向。在消费级单卡环境下，这一默认组合存在两类可量化的效率损失：
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+1.混合负载下短请求的首token时延呈现重尾，本研究的测量中p99达中位数的十三倍，源于长提示的分块预填充对每步token预算的独占；
 
----
+2.解码阶段算力利用存在结构性缺口，本研究的测量中投机解码执行组织的每轮GPU空闲占28.1%，源于控制面串行与小批量kernel的低占用。
 
-## About
+针对上述两类损失，本仓库分别提出并实现：
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+1.一个软件层优化：长度分区加权调度器。
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
+2.一个硬件执行层优化：draft模型投机解码及其双流重叠扩展。
 
-vLLM is fast with:
+并量化了各自的生效条件、收益与代价，并验证两层优化组合时的交互效应。
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
+部分问题发现与瓶颈定位和剖析图如下：
 
-vLLM is flexible and easy to use with:
+1.混合负载下先来先服务基线的短/长请求首token时延分布（左：1.6请求/秒；右：2.4请求/秒；箱体为四分位，离群点隐藏）
 
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
+<img width="940" height="420" alt="image" src="https://github.com/user-attachments/assets/68d8d0ae-6fa7-46f7-9a77-d48cb2cd0070" />
 
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
+2.投机轮时间分解
 
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
+<img width="940" height="134" alt="image" src="https://github.com/user-attachments/assets/99f76842-262b-45d1-a916-714da44ba361" />
 
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
+3.引擎核心进程处理器时间构成
 
-## Getting Started
+<img width="940" height="561" alt="image" src="https://github.com/user-attachments/assets/1d33c8c7-1b84-47a8-a211-746cadf90148" />
 
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
 
-```bash
-uv pip install vllm
-```
+## 环境需求
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+nvcc-12.8/12.9，以及支持nvcc-12.8/12.9的对应cuda版本及驱动版本
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
+target model: Qwen3-8B
 
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+draft model: Qwen3-0.6B
 
-## Contributing
+## 复现所有实验
 
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
+请按照 ./复现指南.md进行逐步环境配置，并运行一键复现脚本完成本仓库所有实验的复现。
 
-## Citation
+## 实验报告
+本仓库实验报告随邮件一起提交。
 
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
-```
-
-## Contact Us
-
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
-
-## Media Kit
-
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+## 实验结果速览
+<img width="941" height="381" alt="image" src="https://github.com/user-attachments/assets/520c9bd1-220f-43c1-9eb5-a8ceab8a9c2b" />
